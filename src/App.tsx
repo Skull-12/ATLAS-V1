@@ -50,11 +50,15 @@ interface SpeechRecognitionErrorEvent extends Event {
 interface SpeechRecognitionInstance extends EventTarget {
   continuous: boolean;
   interimResults: boolean;
+  maxAlternatives?: number;
   lang: string;
   start: () => void;
   stop: () => void;
   abort: () => void;
   onstart: ((this: SpeechRecognitionInstance, ev: Event) => void) | null;
+  onaudiostart?: ((this: SpeechRecognitionInstance, ev: Event) => void) | null;
+  onsoundstart?: ((this: SpeechRecognitionInstance, ev: Event) => void) | null;
+  onspeechstart?: ((this: SpeechRecognitionInstance, ev: Event) => void) | null;
   onresult: ((this: SpeechRecognitionInstance, ev: SpeechRecognitionEvent) => void) | null;
   onerror: ((this: SpeechRecognitionInstance, ev: SpeechRecognitionErrorEvent) => void) | null;
   onend: ((this: SpeechRecognitionInstance, ev: Event) => void) | null;
@@ -86,6 +90,13 @@ const SILENCE_WAIT_MS = 950;
 const REQUEST_COOLDOWN_MS = 1200;
 // Maximum stored conversation items
 const MAX_STORED_MESSAGES = 30;
+
+function isMobileBrowser(): boolean {
+  if (typeof navigator === 'undefined') return false;
+  return /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini|Mobile/i.test(
+    navigator.userAgent
+  );
+}
 
 function formatTimestamp(date = new Date()): string {
   return date.toLocaleTimeString([], {
@@ -133,6 +144,70 @@ function cleanFinalTranscript(raw: string): string {
   }
 
   return deduplicated.join(' ').trim();
+}
+
+/**
+ * Safely merges SpeechRecognition result segments across both Desktop and Mobile (Android/iOS),
+ * preventing Android Chrome's cumulative result duplication bug.
+ */
+function extractMergedTranscript(results: SpeechRecognitionResultList): {
+  finalText: string;
+  interimText: string;
+  combinedText: string;
+} {
+  let finalBuilder = '';
+  let interimBuilder = '';
+
+  for (let i = 0; i < results.length; i++) {
+    const res = results[i];
+    const segment = (res[0]?.transcript || '').trim();
+    if (!segment) continue;
+
+    if (res.isFinal) {
+      if (!finalBuilder) {
+        finalBuilder = segment;
+      } else {
+        const lowerPrev = finalBuilder.toLowerCase();
+        const lowerSeg = segment.toLowerCase();
+        // Android Chrome often repeats the cumulative phrase in subsequent final segments
+        if (lowerSeg.startsWith(lowerPrev)) {
+          finalBuilder = segment;
+        } else if (!lowerPrev.endsWith(lowerSeg)) {
+          finalBuilder = `${finalBuilder} ${segment}`;
+        }
+      }
+    } else {
+      if (!interimBuilder) {
+        interimBuilder = segment;
+      } else {
+        const lowerPrevInterim = interimBuilder.toLowerCase();
+        const lowerSeg = segment.toLowerCase();
+        if (lowerSeg.startsWith(lowerPrevInterim)) {
+          interimBuilder = segment;
+        } else if (!lowerPrevInterim.endsWith(lowerSeg)) {
+          interimBuilder = `${interimBuilder} ${segment}`;
+        }
+      }
+    }
+  }
+
+  // Also check if interimBuilder already contains finalBuilder on mobile
+  let combined = '';
+  if (finalBuilder && interimBuilder) {
+    if (interimBuilder.toLowerCase().startsWith(finalBuilder.toLowerCase())) {
+      combined = interimBuilder;
+    } else {
+      combined = `${finalBuilder} ${interimBuilder}`;
+    }
+  } else {
+    combined = finalBuilder || interimBuilder;
+  }
+
+  return {
+    finalText: finalBuilder.trim(),
+    interimText: interimBuilder.trim(),
+    combinedText: combined.replace(/\s+/g, ' ').trim(),
+  };
 }
 
 export default function App() {
@@ -192,7 +267,7 @@ export default function App() {
   const [systemStatus, setSystemStatus] = useState<SystemHealthStatus>({
     online: true,
     aiConfigured: true,
-    model: 'gemini-3.8-flash',
+    model: 'gemini-3.1-flash-lite',
     searchAvailable: true,
   });
 
@@ -209,23 +284,22 @@ export default function App() {
   const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
   const silenceTimerRef = useRef<number | null>(null);
   const errorResetTimerRef = useRef<number | null>(null);
+  const speakDelayTimerRef = useRef<number | null>(null);
 
   const isListeningRef = useRef<boolean>(false);
   const isProcessingRef = useRef<boolean>(false);
   const isSpeakingRef = useRef<boolean>(false);
   const hasFinalizedSpeechRef = useRef<boolean>(false);
+  const ttsUnlockedRef = useRef<boolean>(false);
 
-  const finalTranscriptRef = useRef<string>('');
-  const interimTranscriptRef = useRef<string>('');
+  const accumulatedTranscriptRef = useRef<string>('');
 
   const abortControllerRef = useRef<AbortController | null>(null);
   const lastRequestTimeRef = useRef<number>(0);
   const lastSubmittedMessageRef = useRef<string>('');
   const retryAfterUntilRef = useRef<number>(0);
 
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const mediaStreamRef = useRef<MediaStream | null>(null);
-  const analyserFrameRef = useRef<number | null>(null);
+  const listeningMeterIntervalRef = useRef<number | null>(null);
   const speechPulseIntervalRef = useRef<number | null>(null);
 
   const settingsRef = useRef<VoiceSettings>(settings);
@@ -262,7 +336,7 @@ export default function App() {
           setSystemStatus({
             online: Boolean(data.online),
             aiConfigured: Boolean(data.aiConfigured),
-            model: data.model || 'gemini-3.8-flash',
+            model: data.model || 'gemini-3.1-flash-lite',
             searchAvailable: Boolean(data.searchAvailable),
           });
         }
@@ -293,7 +367,7 @@ export default function App() {
           };
         })
         .catch(() => {
-          // Permissions API might not support 'microphone' in all browsers
+          // Permissions API might not support 'microphone' on iOS Safari
         });
     }
   }, []);
@@ -319,6 +393,25 @@ export default function App() {
     };
   }, []);
 
+  /**
+   * Unlocks mobile SpeechSynthesis audio inside a synchronous user tap gesture.
+   * Required on iOS Safari and mobile Chrome so async TTS after fetch() is allowed to play.
+   */
+  const unlockMobileSpeechSynthesis = useCallback(() => {
+    if (ttsUnlockedRef.current) return;
+    if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
+    try {
+      window.speechSynthesis.resume();
+      const silentUtterance = new SpeechSynthesisUtterance('');
+      silentUtterance.volume = 0;
+      silentUtterance.rate = 1;
+      window.speechSynthesis.speak(silentUtterance);
+      ttsUnlockedRef.current = true;
+    } catch {
+      // Ignore warmup error
+    }
+  }, []);
+
   // Helper to show a temporary error state and return safely to idle
   const showTemporaryError = useCallback((msg: string, durationMs = 4500) => {
     if (errorResetTimerRef.current) {
@@ -331,72 +424,47 @@ export default function App() {
     }, durationMs);
   }, []);
 
-  // Stop Microphone Web Audio Stream
-  const stopAudioAnalyser = useCallback(() => {
-    if (analyserFrameRef.current) {
-      cancelAnimationFrame(analyserFrameRef.current);
-      analyserFrameRef.current = null;
-    }
-    if (mediaStreamRef.current) {
-      mediaStreamRef.current.getTracks().forEach((track) => track.stop());
-      mediaStreamRef.current = null;
-    }
-    if (audioContextRef.current) {
-      audioContextRef.current.close().catch(() => {});
-      audioContextRef.current = null;
+  // Stop Listening Visualizer Meter
+  const stopListeningVisualizer = useCallback(() => {
+    if (listeningMeterIntervalRef.current) {
+      window.clearInterval(listeningMeterIntervalRef.current);
+      listeningMeterIntervalRef.current = null;
     }
     setFrequencyData(null);
     setAudioLevel(0);
   }, []);
 
-  // Start Microphone Web Audio Stream for Live Frequency Bars
-  const startAudioAnalyser = useCallback(async () => {
-    try {
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return;
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-        },
-      });
-      setMicPermission('granted');
-      mediaStreamRef.current = stream;
-
-      const AudioCtx =
-        window.AudioContext ||
-        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      const audioCtx = new AudioCtx();
-      audioContextRef.current = audioCtx;
-
-      const source = audioCtx.createMediaStreamSource(stream);
-      const analyser = audioCtx.createAnalyser();
-      analyser.fftSize = 128;
-      analyser.smoothingTimeConstant = 0.78;
-      source.connect(analyser);
-
-      const bufferLength = analyser.frequencyBinCount;
-      const dataArray = new Uint8Array(bufferLength);
-
-      const updateAudioMeter = () => {
-        if (!isListeningRef.current) return;
-        analyser.getByteFrequencyData(dataArray);
-        setFrequencyData(new Uint8Array(dataArray));
-
-        let sum = 0;
-        for (let i = 0; i < bufferLength; i++) {
-          sum += dataArray[i];
-        }
-        const avg = sum / bufferLength / 255;
-        setAudioLevel(Math.min(1, avg * 2.2));
-
-        analyserFrameRef.current = requestAnimationFrame(updateAudioMeter);
-      };
-
-      analyserFrameRef.current = requestAnimationFrame(updateAudioMeter);
-    } catch {
-      // Fallback handled by VoiceVisualizer
-    }
-  }, []);
+  /**
+   * Starts the listening waveform meter WITHOUT calling getUserMedia().
+   * CRITICAL FOR MOBILE: Calling navigator.mediaDevices.getUserMedia() while SpeechRecognition
+   * is active steals the hardware microphone on Android and iOS, causing SpeechRecognition to hear nothing!
+   */
+  const startListeningVisualizer = useCallback(() => {
+    stopListeningVisualizer();
+    listeningMeterIntervalRef.current = window.setInterval(() => {
+      if (!isListeningRef.current) return;
+      const syntheticBins = new Uint8Array(64);
+      const t = Date.now() * 0.008;
+      let sum = 0;
+      for (let i = 0; i < 64; i++) {
+        const val = Math.min(
+          255,
+          Math.max(
+            20,
+            Math.floor(
+              (Math.abs(Math.sin(i * 0.25 + t)) * 0.55 +
+                Math.abs(Math.cos(i * 0.4 - t * 1.3)) * 0.45) *
+                185
+            )
+          )
+        );
+        syntheticBins[i] = val;
+        sum += val;
+      }
+      setFrequencyData(syntheticBins);
+      setAudioLevel(sum / 64 / 255);
+    }, 80);
+  }, [stopListeningVisualizer]);
 
   // Immediately stop SpeechRecognition without processing
   const abortSpeechRecognition = useCallback(() => {
@@ -405,7 +473,7 @@ export default function App() {
       silenceTimerRef.current = null;
     }
     isListeningRef.current = false;
-    stopAudioAnalyser();
+    stopListeningVisualizer();
     if (recognitionRef.current) {
       try {
         recognitionRef.current.onresult = null;
@@ -417,16 +485,24 @@ export default function App() {
       }
       recognitionRef.current = null;
     }
-  }, [stopAudioAnalyser]);
+  }, [stopListeningVisualizer]);
 
   // Stop Speaking Function
   const stopSpeaking = useCallback(() => {
+    if (speakDelayTimerRef.current) {
+      window.clearTimeout(speakDelayTimerRef.current);
+      speakDelayTimerRef.current = null;
+    }
     if (speechPulseIntervalRef.current) {
       window.clearInterval(speechPulseIntervalRef.current);
       speechPulseIntervalRef.current = null;
     }
     if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
-      window.speechSynthesis.cancel();
+      try {
+        window.speechSynthesis.cancel();
+      } catch {
+        // Ignore
+      }
     }
     if (isSpeakingRef.current) {
       console.log('[ATLAS] Speech synthesis finished');
@@ -456,11 +532,14 @@ export default function App() {
         return;
       }
 
+      if (speakDelayTimerRef.current) {
+        window.clearTimeout(speakDelayTimerRef.current);
+        speakDelayTimerRef.current = null;
+      }
       if (speechPulseIntervalRef.current) {
         window.clearInterval(speechPulseIntervalRef.current);
         speechPulseIntervalRef.current = null;
       }
-      window.speechSynthesis.cancel();
 
       const cleaned = cleanTextForSpeech(rawText);
       if (!cleaned) {
@@ -469,78 +548,106 @@ export default function App() {
         return;
       }
 
-      const utterance = new SpeechSynthesisUtterance(cleaned);
-      utterance.rate = currentSettings.rate;
-      utterance.pitch = currentSettings.pitch;
-      utterance.lang = currentSettings.language;
-
-      const voices = window.speechSynthesis.getVoices();
-      if (currentSettings.voiceURI) {
-        const matched = voices.find((v) => v.voiceURI === currentSettings.voiceURI);
-        if (matched) {
-          utterance.voice = matched;
+      // Cancel any ongoing speech first
+      try {
+        if (window.speechSynthesis.speaking || window.speechSynthesis.pending) {
+          window.speechSynthesis.cancel();
         }
-      } else if (currentSettings.language === 'id-ID') {
-        const idVoice = voices.find((v) => v.lang.toLowerCase().startsWith('id'));
-        if (idVoice) {
-          utterance.voice = idVoice;
-        }
-      } else {
-        const preferredEn =
-          voices.find(
-            (v) =>
-              v.lang.startsWith('en') &&
-              (v.name.includes('Google') ||
-                v.name.includes('Natural') ||
-                v.name.includes('Daniel') ||
-                v.name.includes('Samantha'))
-          ) || voices.find((v) => v.lang.startsWith('en'));
-        if (preferredEn) {
-          utterance.voice = preferredEn;
-        }
+      } catch {
+        // Ignore
       }
-
-      utterance.onstart = () => {
-        console.log('[ATLAS] Speech synthesis started');
-        isSpeakingRef.current = true;
-        setCoreState('speaking');
-        if (speechPulseIntervalRef.current) {
-          window.clearInterval(speechPulseIntervalRef.current);
-        }
-        speechPulseIntervalRef.current = window.setInterval(() => {
-          setAudioLevel(0.25 + Math.random() * 0.65);
-        }, 110);
-      };
-
-      utterance.onboundary = () => {
-        setAudioLevel(0.4 + Math.random() * 0.6);
-      };
-
-      utterance.onend = () => {
-        console.log('[ATLAS] Speech synthesis finished');
-        if (speechPulseIntervalRef.current) {
-          window.clearInterval(speechPulseIntervalRef.current);
-          speechPulseIntervalRef.current = null;
-        }
-        isSpeakingRef.current = false;
-        setAudioLevel(0);
-        setCoreState('idle');
-      };
-
-      utterance.onerror = () => {
-        console.log('[ATLAS] Speech synthesis finished');
-        if (speechPulseIntervalRef.current) {
-          window.clearInterval(speechPulseIntervalRef.current);
-          speechPulseIntervalRef.current = null;
-        }
-        isSpeakingRef.current = false;
-        setAudioLevel(0);
-        setCoreState('idle');
-      };
 
       isSpeakingRef.current = true;
       setCoreState('speaking');
-      window.speechSynthesis.speak(utterance);
+
+      // Small 60ms delay after cancel() fixes the Android Chrome bug where cancel() + immediate speak() drops audio
+      speakDelayTimerRef.current = window.setTimeout(() => {
+        try {
+          window.speechSynthesis.resume();
+
+          const utterance = new SpeechSynthesisUtterance(cleaned);
+          utterance.volume = 1.0;
+          utterance.rate = currentSettings.rate;
+          utterance.pitch = currentSettings.pitch;
+          utterance.lang = currentSettings.language;
+
+          const voices = window.speechSynthesis.getVoices();
+          if (currentSettings.voiceURI) {
+            const matched = voices.find((v) => v.voiceURI === currentSettings.voiceURI);
+            if (matched) {
+              utterance.voice = matched;
+            }
+          } else if (currentSettings.language === 'id-ID') {
+            const idVoice = voices.find((v) => v.lang.toLowerCase().startsWith('id'));
+            if (idVoice) {
+              utterance.voice = idVoice;
+            }
+          } else {
+            const preferredEn =
+              voices.find(
+                (v) =>
+                  v.lang.startsWith('en') &&
+                  (v.name.includes('Google') ||
+                    v.name.includes('Natural') ||
+                    v.name.includes('Samantha') ||
+                    v.name.includes('Daniel'))
+              ) || voices.find((v) => v.lang.startsWith('en'));
+            if (preferredEn) {
+              utterance.voice = preferredEn;
+            }
+          }
+
+          let tickCount = 0;
+          utterance.onstart = () => {
+            console.log('[ATLAS] Speech synthesis started');
+            isSpeakingRef.current = true;
+            setCoreState('speaking');
+            if (speechPulseIntervalRef.current) {
+              window.clearInterval(speechPulseIntervalRef.current);
+            }
+            speechPulseIntervalRef.current = window.setInterval(() => {
+              tickCount += 1;
+              setAudioLevel(0.25 + Math.random() * 0.65);
+              // Mobile Chrome keep-alive to prevent 15s speech synthesis cutoff
+              if (tickCount % 30 === 0 && window.speechSynthesis.speaking) {
+                window.speechSynthesis.resume();
+              }
+            }, 110);
+          };
+
+          utterance.onboundary = () => {
+            setAudioLevel(0.4 + Math.random() * 0.6);
+          };
+
+          utterance.onend = () => {
+            console.log('[ATLAS] Speech synthesis finished');
+            if (speechPulseIntervalRef.current) {
+              window.clearInterval(speechPulseIntervalRef.current);
+              speechPulseIntervalRef.current = null;
+            }
+            isSpeakingRef.current = false;
+            setAudioLevel(0);
+            setCoreState('idle');
+          };
+
+          utterance.onerror = () => {
+            console.log('[ATLAS] Speech synthesis finished');
+            if (speechPulseIntervalRef.current) {
+              window.clearInterval(speechPulseIntervalRef.current);
+              speechPulseIntervalRef.current = null;
+            }
+            isSpeakingRef.current = false;
+            setAudioLevel(0);
+            setCoreState('idle');
+          };
+
+          window.speechSynthesis.speak(utterance);
+        } catch {
+          isSpeakingRef.current = false;
+          setAudioLevel(0);
+          setCoreState('idle');
+        }
+      }, 60);
     },
     [abortSpeechRecognition]
   );
@@ -596,7 +703,7 @@ export default function App() {
 
       setMessages((prev) => [...prev.slice(-(MAX_STORED_MESSAGES - 1)), userMsg]);
 
-      // Check local commands first (time, date, math, UI panels, browser links)
+      // Check local commands first (time, date, identity, math, UI panels, browser links)
       const commandEval = evaluateUserCommand(cleanedMessage);
 
       if (commandEval.uiAction === 'open_settings') {
@@ -736,10 +843,7 @@ export default function App() {
             console.warn('[ATLAS] Technical API diagnostic:', data.technicalError);
           }
           throw new Error(
-            data.error ||
-              (response.status === 404
-                ? 'ATLAS API endpoint (/api/atlas/chat) was not found on this host.'
-                : 'ATLAS is temporarily busy. Please wait a moment and try again.')
+            data.error || 'ATLAS is temporarily busy. Please wait a moment and try again.'
           );
         }
 
@@ -808,7 +912,7 @@ export default function App() {
     }
 
     isListeningRef.current = false;
-    stopAudioAnalyser();
+    stopListeningVisualizer();
 
     if (recognitionRef.current) {
       try {
@@ -821,11 +925,10 @@ export default function App() {
       recognitionRef.current = null;
     }
 
-    const combinedRaw = `${finalTranscriptRef.current} ${interimTranscriptRef.current}`.trim();
-    finalTranscriptRef.current = '';
-    interimTranscriptRef.current = '';
+    const rawCollected = accumulatedTranscriptRef.current.trim();
+    accumulatedTranscriptRef.current = '';
 
-    const cleaned = cleanFinalTranscript(combinedRaw);
+    const cleaned = cleanFinalTranscript(rawCollected);
     console.log('[ATLAS] Speech finalized');
 
     if (!cleaned || cleaned.length < 2) {
@@ -836,19 +939,24 @@ export default function App() {
     }
 
     sendMessageToAI(cleaned);
-  }, [sendMessageToAI, stopAudioAnalyser]);
+  }, [sendMessageToAI, stopListeningVisualizer]);
 
-  // Start Listening via Web Speech API (with continuous=true, interimResults=true, and 950ms pause buffer)
+  // Start Listening via Web Speech API (Mobile + Desktop compatible)
   const startListening = useCallback(() => {
     // Do not start listening if a request is processing or if ATLAS is currently speaking
     if (isProcessingRef.current || isSpeakingRef.current) {
       return;
     }
 
+    // Unlock mobile TTS inside the synchronous user tap gesture
+    unlockMobileSpeechSynthesis();
+
     const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SpeechRec) {
       setSpeechRecognitionSupported(false);
-      showTemporaryError('Speech recognition is not supported in this browser.');
+      showTemporaryError(
+        'Voice recognition is not supported on this browser. Please use Chrome, Safari, or the text input below.'
+      );
       return;
     }
 
@@ -862,14 +970,17 @@ export default function App() {
 
     setErrorMessage(null);
     setLiveTranscript('');
-    finalTranscriptRef.current = '';
-    interimTranscriptRef.current = '';
+    accumulatedTranscriptRef.current = '';
     hasFinalizedSpeechRef.current = false;
 
     try {
       const recognition = new SpeechRec();
-      recognition.continuous = true;
+      // On mobile browsers (Android Chrome / iOS Safari), continuous=false is far more reliable
+      // while desktop browsers support continuous=true with our 950ms silence timer.
+      const mobile = isMobileBrowser();
+      recognition.continuous = !mobile;
       recognition.interimResults = true;
+      recognition.maxAlternatives = 1;
       recognition.lang = settingsRef.current.language || 'en-US';
 
       recognition.onstart = () => {
@@ -877,41 +988,30 @@ export default function App() {
         isListeningRef.current = true;
         setMicPermission('granted');
         setCoreState('listening');
-        startAudioAnalyser();
+        // Do NOT call getUserMedia() here so SpeechRecognition retains exclusive mic access on mobile!
+        startListeningVisualizer();
       };
 
       recognition.onresult = (event: SpeechRecognitionEvent) => {
-        // Ignore any recognition events if ATLAS is speaking or already finalized
         if (isSpeakingRef.current || hasFinalizedSpeechRef.current) {
           return;
         }
 
-        let finalBuilder = '';
-        let interimBuilder = '';
-
-        for (let i = 0; i < event.results.length; i++) {
-          const res = event.results[i];
-          const textPiece = res[0]?.transcript || '';
-          if (res.isFinal) {
-            finalBuilder += textPiece + ' ';
-          } else {
-            interimBuilder += textPiece + ' ';
-          }
+        const { combinedText } = extractMergedTranscript(event.results);
+        if (combinedText) {
+          accumulatedTranscriptRef.current = combinedText;
+          // Update live UI transcript ONLY — never call Gemini here
+          setLiveTranscript(combinedText);
+          // Boost visualizer level when voice words arrive
+          setAudioLevel(0.55 + Math.random() * 0.4);
         }
-
-        finalTranscriptRef.current = finalBuilder.trim();
-        interimTranscriptRef.current = interimBuilder.trim();
-
-        const currentCombined = `${finalTranscriptRef.current} ${interimTranscriptRef.current}`.trim();
-        // Update live UI transcript ONLY — never call Gemini here
-        setLiveTranscript(currentCombined);
 
         // Intelligent silence handling: reset the 950ms silence timer whenever new speech arrives
         if (silenceTimerRef.current) {
           window.clearTimeout(silenceTimerRef.current);
         }
 
-        if (currentCombined.length > 0) {
+        if (accumulatedTranscriptRef.current.length > 0) {
           silenceTimerRef.current = window.setTimeout(() => {
             finalizeListeningSession();
           }, SILENCE_WAIT_MS);
@@ -924,12 +1024,16 @@ export default function App() {
           silenceTimerRef.current = null;
         }
         isListeningRef.current = false;
-        stopAudioAnalyser();
+        stopListeningVisualizer();
 
         if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
           setMicPermission('denied');
           showTemporaryError(
-            'Microphone access was denied. Please allow microphone permission or type your command.'
+            'Microphone access was denied. Please allow microphone permission in your browser settings or type below.'
+          );
+        } else if (event.error === 'audio-capture') {
+          showTemporaryError(
+            'Microphone hardware could not be accessed. Please check that no other app is using the microphone.'
           );
         } else if (event.error === 'no-speech') {
           setLiveTranscript('');
@@ -939,7 +1043,7 @@ export default function App() {
           setCoreState((prev) => (prev === 'listening' ? 'idle' : prev));
         } else {
           console.warn('[ATLAS] SpeechRecognition error:', event.error);
-          showTemporaryError(`Speech recognition error (${event.error}). Please try again.`);
+          showTemporaryError(`Speech recognition notice (${event.error}). Please try again.`);
         }
       };
 
@@ -948,9 +1052,8 @@ export default function App() {
           return;
         }
 
-        // If the browser ended recognition while we have collected speech, wait for or trigger finalization once
-        const collected = `${finalTranscriptRef.current} ${interimTranscriptRef.current}`.trim();
-        if (collected.length > 0) {
+        // If recognition ended and we have captured speech, finalize once
+        if (accumulatedTranscriptRef.current.trim().length > 0) {
           if (silenceTimerRef.current) {
             window.clearTimeout(silenceTimerRef.current);
             silenceTimerRef.current = null;
@@ -958,7 +1061,7 @@ export default function App() {
           finalizeListeningSession();
         } else {
           isListeningRef.current = false;
-          stopAudioAnalyser();
+          stopListeningVisualizer();
           setCoreState((prev) => (prev === 'listening' ? 'idle' : prev));
         }
       };
@@ -966,20 +1069,24 @@ export default function App() {
       recognitionRef.current = recognition;
       recognition.start();
     } catch (err) {
-      console.error('[ATLAS] Could not initialize speech recognition:', err);
-      showTemporaryError('Could not initialize speech recognition.');
+      console.warn('[ATLAS] Could not initialize speech recognition:', err);
+      showTemporaryError('Could not start microphone recognition. Please try again.');
     }
   }, [
     abortSpeechRecognition,
     finalizeListeningSession,
     showTemporaryError,
-    startAudioAnalyser,
-    stopAudioAnalyser,
+    startListeningVisualizer,
+    stopListeningVisualizer,
     stopSpeaking,
+    unlockMobileSpeechSynthesis,
   ]);
 
   // Toggle Microphone Button / Orb Click
   const handleToggleListening = useCallback(() => {
+    // Unlock mobile TTS on user tap
+    unlockMobileSpeechSynthesis();
+
     // Prevent duplicate actions while thinking
     if (isProcessingRef.current || coreState === 'thinking') {
       return;
@@ -993,8 +1100,7 @@ export default function App() {
 
     // If currently listening, finalize any spoken transcript or return to idle
     if (coreState === 'listening' || isListeningRef.current) {
-      const collected = `${finalTranscriptRef.current} ${interimTranscriptRef.current}`.trim();
-      if (collected.length > 0) {
+      if (accumulatedTranscriptRef.current.trim().length > 0) {
         finalizeListeningSession();
       } else {
         abortSpeechRecognition();
@@ -1011,7 +1117,17 @@ export default function App() {
     finalizeListeningSession,
     startListening,
     stopSpeaking,
+    unlockMobileSpeechSynthesis,
   ]);
+
+  // Handle Text Submission (Unlocks mobile TTS on submit tap, then calls centralized sendMessageToAI)
+  const handleTextSubmit = useCallback(
+    (text: string) => {
+      unlockMobileSpeechSynthesis();
+      sendMessageToAI(text);
+    },
+    [sendMessageToAI, unlockMobileSpeechSynthesis]
+  );
 
   // Request Microphone Permission Explicitly from Settings
   const handleRequestMicPermission = useCallback(async () => {
@@ -1043,7 +1159,7 @@ export default function App() {
     setCoreState('idle');
   }, [abortSpeechRecognition, stopSpeaking]);
 
-  // Update Settings Helper (If language changes while listening, restart with new language)
+  // Update Settings Helper (If language changes while listening, restart cleanly)
   const handleUpdateSettings = useCallback(
     (partial: Partial<VoiceSettings>) => {
       setSettings((prev) => {
@@ -1156,7 +1272,7 @@ export default function App() {
           micPermission={micPermission}
           darkMode={darkMode}
           onToggleListening={handleToggleListening}
-          onSubmitText={sendMessageToAI}
+          onSubmitText={handleTextSubmit}
         />
 
         {/* Live Status Indicator, Live Transcript & Active Response Card */}
@@ -1169,14 +1285,17 @@ export default function App() {
           errorMessage={errorMessage}
           darkMode={darkMode}
           onStopSpeaking={stopSpeaking}
-          onReplaySpeech={(txt) => speakResponse(txt, true)}
+          onReplaySpeech={(txt) => {
+            unlockMobileSpeechSynthesis();
+            speakResponse(txt, true);
+          }}
         />
       </main>
 
       {/* Bottom Voice Directives / Command Handler Deck */}
       <footer className="relative z-10 w-full pb-5 pt-2">
         <CommandHandler
-          onSelectCommand={sendMessageToAI}
+          onSelectCommand={handleTextSubmit}
           disabled={coreState === 'thinking'}
           darkMode={darkMode}
         />
@@ -1189,9 +1308,12 @@ export default function App() {
         isProcessing={coreState === 'thinking'}
         darkMode={darkMode}
         onClose={() => setIsConversationOpen(false)}
-        onSendMessage={sendMessageToAI}
+        onSendMessage={handleTextSubmit}
         onClearConversation={handleClearConversation}
-        onReplaySpeech={(txt) => speakResponse(txt, true)}
+        onReplaySpeech={(txt) => {
+          unlockMobileSpeechSynthesis();
+          speakResponse(txt, true);
+        }}
       />
 
       {/* System Calibration & Voice Settings Modal */}
@@ -1205,14 +1327,15 @@ export default function App() {
         messageCount={messages.length}
         onClose={() => setIsSettingsOpen(false)}
         onUpdateSettings={handleUpdateSettings}
-        onTestVoice={() =>
+        onTestVoice={() => {
+          unlockMobileSpeechSynthesis();
           speakResponse(
             settings.language === 'id-ID'
               ? 'Sistem suara ATLAS telah dikalibrasi dan siap digunakan.'
               : 'ATLAS voice synthesis calibrated and operating at nominal parameters.',
             true
-          )
-        }
+          );
+        }}
         onRequestMicPermission={handleRequestMicPermission}
         onClearConversation={handleClearConversation}
       />
