@@ -736,7 +736,10 @@ export default function App() {
             console.warn('[ATLAS] Technical API diagnostic:', data.technicalError);
           }
           throw new Error(
-            data.error || 'ATLAS encountered an issue processing your request. Please try again.'
+            data.error ||
+              (response.status === 404
+                ? 'ATLAS API endpoint (/api/atlas/chat) was not found on this host.'
+                : 'ATLAS is temporarily busy. Please wait a moment and try again.')
           );
         }
 
