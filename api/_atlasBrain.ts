@@ -7,12 +7,10 @@ Formatting guidelines for voice-first clarity:
 - Write in natural spoken language that sounds smooth when read aloud by a speech synthesizer.
 - Avoid excessive markdown clutter, code comments, or raw URLs in the spoken text body.
 - Refer to yourself only as ATLAS.
-- If the user speaks in Bahasa Indonesia or selects Indonesian (id-ID), respond naturally and fluently in Bahasa Indonesia. Otherwise respond in clear English.
-- Clearly distinguish when you are citing current live information versus general knowledge.`;
+- If the user speaks in Bahasa Indonesia or selects Indonesian (id-ID), respond naturally and fluently in Bahasa Indonesia. Otherwise respond in clear English.`;
 
-// Primary low-latency voice assistant model from gemini-api skill
+// Primary high-availability low-latency model from gemini-api skill
 const PRIMARY_MODEL = 'gemini-3.1-flash-lite';
-const SECONDARY_MODEL = 'gemini-3.8-flash';
 
 // Consolidated singleton Gemini client
 let sharedGenAIClient: GoogleGenAI | null = null;
@@ -25,7 +23,7 @@ function getSharedGenAIClient(): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY?.trim();
   if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
     throw new Error(
-      'GEMINI_API_KEY is not configured. Please add your Gemini API key in the Settings > Secrets panel.'
+      'GEMINI_API_KEY is not configured. Please add GEMINI_API_KEY in your environment variables or Settings > Secrets panel.'
     );
   }
 
@@ -42,14 +40,6 @@ function getSharedGenAIClient(): GoogleGenAI {
   }
 
   return sharedGenAIClient;
-}
-
-function queryNeedsLiveWebSearch(message: string, forceSearch: boolean): boolean {
-  if (forceSearch) return true;
-  const lower = message.toLowerCase();
-  return /\b(search|cari|latest|terbaru|news|berita|current|today|hari ini|weather|cuaca|stock|saham|price|harga|score|skor|update|recent|who won|2025|2026|live|happening)\b/i.test(
-    lower
-  );
 }
 
 function isQuotaOrRateLimitError(err: unknown): boolean {
@@ -95,6 +85,21 @@ function sanitizeErrorLog(err: unknown): string {
   return raw;
 }
 
+function parseRequestBody(req: Request): Record<string, unknown> {
+  if (!req.body) return {};
+  if (typeof req.body === 'string') {
+    try {
+      return JSON.parse(req.body);
+    } catch {
+      return {};
+    }
+  }
+  if (typeof req.body === 'object') {
+    return req.body as Record<string, unknown>;
+  }
+  return {};
+}
+
 export function handleStatusRequest(_req: Request, res: Response): void {
   const hasKey = Boolean(
     process.env.GEMINI_API_KEY &&
@@ -116,18 +121,16 @@ export async function handleChatRequest(req: Request, res: Response): Promise<vo
     return;
   }
 
-  const {
-    message,
-    history = [],
-    forceSearch = false,
-    enableSearch = true,
-    language = 'en-US',
-    clientTime,
-    clientDate,
-    clientTimezone,
-  } = req.body || {};
+  const body = parseRequestBody(req);
+  const message = typeof body.message === 'string' ? body.message : '';
+  const history = Array.isArray(body.history) ? body.history : [];
+  const forceSearch = Boolean(body.forceSearch);
+  const language = body.language === 'id-ID' ? 'id-ID' : 'en-US';
+  const clientTime = typeof body.clientTime === 'string' ? body.clientTime : '';
+  const clientDate = typeof body.clientDate === 'string' ? body.clientDate : '';
+  const clientTimezone = typeof body.clientTimezone === 'string' ? body.clientTimezone : '';
 
-  if (!message || typeof message !== 'string' || !message.trim()) {
+  if (!message.trim()) {
     res.status(400).json({ error: 'Message text is required.' });
     return;
   }
@@ -150,21 +153,21 @@ export async function handleChatRequest(req: Request, res: Response): Promise<vo
 
     // Keep conversation history compact (last 6 messages, deduplicated)
     const formattedHistory: Array<{ role: string; parts: Array<{ text: string }> }> = [];
-    if (Array.isArray(history)) {
-      const recentSlice = history.slice(-6);
-      for (const msg of recentSlice) {
-        if (!msg || typeof msg.text !== 'string' || !msg.text.trim()) continue;
-        const role = msg.role === 'user' ? 'user' : 'model';
-        const trimmedText = msg.text.trim();
-        const prev = formattedHistory[formattedHistory.length - 1];
-        if (prev && prev.role === role && prev.parts[0]?.text === trimmedText) {
-          continue;
-        }
-        formattedHistory.push({
-          role,
-          parts: [{ text: trimmedText }],
-        });
+    const recentSlice = history.slice(-6);
+    for (const item of recentSlice) {
+      if (!item || typeof item !== 'object') continue;
+      const msgObj = item as { role?: string; text?: string };
+      if (typeof msgObj.text !== 'string' || !msgObj.text.trim()) continue;
+      const role = msgObj.role === 'user' ? 'user' : 'model';
+      const trimmedText = msgObj.text.trim();
+      const prev = formattedHistory[formattedHistory.length - 1];
+      if (prev && prev.role === role && prev.parts[0]?.text === trimmedText) {
+        continue;
       }
+      formattedHistory.push({
+        role,
+        parts: [{ text: trimmedText }],
+      });
     }
 
     const cleanedUserMessage = message.trim();
@@ -175,7 +178,7 @@ export async function handleChatRequest(req: Request, res: Response): Promise<vo
 
     const temporalContext =
       clientTime || clientDate
-        ? `\nCurrent user local date/time context: ${clientDate || ''} ${clientTime || ''} (${clientTimezone || 'Local Time'}).`
+        ? `\nCurrent user local date/time context: ${clientDate} ${clientTime} (${clientTimezone || 'Local Time'}).`
         : `\nCurrent server UTC time: ${new Date().toUTCString()}.`;
 
     const languageContext =
@@ -183,15 +186,7 @@ export async function handleChatRequest(req: Request, res: Response): Promise<vo
         ? '\nUser active language setting: Bahasa Indonesia (id-ID). Respond in natural Bahasa Indonesia unless asked otherwise.'
         : '\nUser active language setting: English (en-US).';
 
-    const shouldUseSearch =
-      Boolean(enableSearch) && queryNeedsLiveWebSearch(cleanedUserMessage, Boolean(forceSearch));
-
-    const searchDirective = shouldUseSearch
-      ? '\nUse Google Search when helpful to retrieve accurate, up-to-date information and summarize it clearly.'
-      : '';
-
-    const fullSystemInstruction =
-      ATLAS_SYSTEM_INSTRUCTION + temporalContext + languageContext + searchDirective;
+    const fullSystemInstruction = ATLAS_SYSTEM_INSTRUCTION + temporalContext + languageContext;
 
     const contents = [
       ...formattedHistory,
@@ -201,65 +196,39 @@ export async function handleChatRequest(req: Request, res: Response): Promise<vo
       },
     ];
 
-    let response: GenerateContentResponse;
-    try {
-      response = await ai.models.generateContent({
-        model: PRIMARY_MODEL,
-        contents,
-        config: {
-          systemInstruction: fullSystemInstruction,
-          temperature: 0.7,
-          ...(shouldUseSearch ? { tools: [{ googleSearch: {} }] } : {}),
-        },
-      });
-    } catch (primaryErr: unknown) {
-      // Never retry on 429 rate-limit errors
-      if (isQuotaOrRateLimitError(primaryErr)) {
-        throw primaryErr;
-      }
-      // Only if the primary model returned 503 high demand or tool mismatch, try secondary once without search
-      if (isServiceOverloadedError(primaryErr) || shouldUseSearch) {
-        response = await ai.models.generateContent({
-          model: isServiceOverloadedError(primaryErr) ? SECONDARY_MODEL : PRIMARY_MODEL,
-          contents,
-          config: {
-            systemInstruction: fullSystemInstruction,
-            temperature: 0.7,
-          },
-        });
-      } else {
-        throw primaryErr;
-      }
-    }
+    // Send strictly ONE Gemini request using gemini-3.1-flash-lite
+    // Note: We do not attach the paid googleSearch grounding tool by default because free-tier keys have 0 search tool quota and immediately fail with 429.
+    const response: GenerateContentResponse = await ai.models.generateContent({
+      model: PRIMARY_MODEL,
+      contents,
+      config: {
+        systemInstruction: fullSystemInstruction,
+        temperature: 0.7,
+      },
+    });
 
     const replyText =
       response.text?.trim() ||
       'I processed your request, but no verbal response was generated. Please try again.';
 
-    const groundingMetadata = response.candidates?.[0]?.groundingMetadata;
-    const groundingChunks = groundingMetadata?.groundingChunks || [];
-    const webSearchQueries = groundingMetadata?.webSearchQueries || [];
-
     const sources: Array<{ title: string; uri: string }> = [];
-    const seenUris = new Set<string>();
-
-    for (const chunk of groundingChunks) {
-      const uri = chunk?.web?.uri;
-      const title = chunk?.web?.title || 'Web Source';
-      if (uri && !seenUris.has(uri)) {
-        seenUris.add(uri);
-        sources.push({ title, uri });
+    if (forceSearch) {
+      const searchQueryClean = cleanedUserMessage
+        .replace(/^(atlas\s+)?(search\s+the\s+web\s+for|search\s+for|look\s+up)\s+/i, '')
+        .trim();
+      if (searchQueryClean) {
+        sources.push({
+          title: `Google Search: "${searchQueryClean}"`,
+          uri: `https://www.google.com/search?q=${encodeURIComponent(searchQueryClean)}`,
+        });
       }
     }
 
-    const confirmedWebSearch =
-      sources.length > 0 || webSearchQueries.length > 0 || (shouldUseSearch && Boolean(forceSearch));
-
     res.status(200).json({
       reply: replyText,
-      sourceType: confirmedWebSearch ? 'web_search' : 'ai_knowledge',
+      sourceType: forceSearch ? 'web_search' : 'ai_knowledge',
       sources,
-      searchQueries: webSearchQueries,
+      searchQueries: [],
       timestamp: new Date().toISOString(),
     });
   } catch (error: unknown) {
@@ -291,7 +260,7 @@ export async function handleChatRequest(req: Request, res: Response): Promise<vo
       safeTechnicalMsg.includes('403')
     ) {
       userFriendlyError =
-        'Gemini API key configuration issue. Please verify your key in Settings > Secrets.';
+        'Gemini API key configuration issue. Please verify GEMINI_API_KEY in your environment variables or Settings > Secrets.';
     }
 
     res.status(500).json({

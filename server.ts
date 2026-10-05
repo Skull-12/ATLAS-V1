@@ -2,7 +2,7 @@ import dotenv from 'dotenv';
 import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { handleChatRequest, handleStatusRequest } from './src/server/atlasBrain.ts';
+import { handleChatRequest, handleStatusRequest } from './api/_atlasBrain';
 
 dotenv.config();
 

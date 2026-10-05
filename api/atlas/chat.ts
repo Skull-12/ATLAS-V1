@@ -1,3 +1,3 @@
-import { handleChatRequest } from '../../src/server/atlasBrain';
+import { handleChatRequest } from '../_atlasBrain';
 
 export default handleChatRequest;
