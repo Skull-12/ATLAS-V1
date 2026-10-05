@@ -243,7 +243,24 @@ export function evaluateUserCommand(rawText: string): CommandExecutionResult {
     };
   }
 
-  // 4. Capabilities Command ("What can you do?", "Help", "List commands")
+  // 4. Identity & Greeting Commands ("What is your name?", "Who are you?", "Siapa nama kamu?")
+  if (
+    /^(atlas\s+)?(what\s+is\s+your\s+name|what's\s+your\s+name|who\s+are\s+you|tell\s+me\s+your\s+name|siapa\s+nama\s+kamu|siapa\s+namamu|siapa\s+kamu)$/i.test(
+      lower
+    )
+  ) {
+    const isId = /siapa|kamu|namamu/.test(lower);
+    return {
+      handledLocally: true,
+      reply: isId
+        ? 'Nama saya adalah ATLAS, sistem asisten AI pribadi Anda. Saya siap membantu Anda dengan perintah suara, pencarian informasi, kalkulasi, dan analisis.'
+        : 'I am ATLAS, your advanced personal AI system. I am online and ready to assist you with voice directives, questions, calculations, and analysis.',
+      sourceType: 'local_system',
+      commandCategory: 'System Identity',
+    };
+  }
+
+  // 5. Capabilities Command ("What can you do?", "Help", "List commands")
   if (
     /^(atlas\s+)?(what\s+can\s+you\s+do|what\s+are\s+your\s+capabilities|help|list\s+commands|how\s+can\s+you\s+help\s+me)$/i.test(
       lower

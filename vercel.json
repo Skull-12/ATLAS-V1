@@ -1,5 +1,5 @@
 {
-  "installCommand": "npm install --legacy-peer-deps",
+  "installCommand": "npm install --legacy-peer-deps --loglevel=error --no-fund --no-audit",
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
   "framework": "vite"
