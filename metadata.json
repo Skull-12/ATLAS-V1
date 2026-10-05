@@ -1,0 +1,6 @@
+{
+  "name": "ATLAS",
+  "description": "Futuristic voice-first personal AI system with interactive HUD core, real-time speech recognition, neural voice synthesis, and live web search grounding.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
