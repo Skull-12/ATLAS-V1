@@ -11,8 +11,9 @@ import {
   AlertCircle,
   Play,
   Sliders,
+  Languages,
 } from 'lucide-react';
-import { MicPermissionState, VoiceSettings } from '../types/atlas';
+import { MicPermissionState, RecognitionLanguage, VoiceSettings } from '../types/atlas';
 
 interface SettingsPanelProps {
   isOpen: boolean;
@@ -56,6 +57,10 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
     }
     onClearConversation();
     setConfirmClear(false);
+  };
+
+  const handleLanguageChange = (lang: RecognitionLanguage) => {
+    onUpdateSettings({ language: lang });
   };
 
   const renderMicPermissionStatus = () => {
@@ -139,8 +144,65 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
         </div>
 
         <div className="space-y-5">
-          {/* 1. Voice Synthesis Configuration */}
-          <div className="space-y-3.5">
+          {/* 1. Speech Recognition Language Selector (English & Bahasa Indonesia) */}
+          <div className="space-y-2.5">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-mono uppercase tracking-wider text-cyan-400 flex items-center gap-1.5">
+                <Languages className="w-3.5 h-3.5" />
+                <span>Language</span>
+              </span>
+              <span className={`text-xs font-mono ${darkMode ? 'text-slate-400' : 'text-slate-500'}`}>
+                Active: {settings.language}
+              </span>
+            </div>
+
+            <div
+              role="group"
+              aria-label="Voice Recognition Language"
+              className={`grid grid-cols-2 gap-2 p-1 rounded-xl border ${
+                darkMode
+                  ? 'bg-slate-900/90 border-cyan-500/25'
+                  : 'bg-slate-100 border-slate-300'
+              }`}
+            >
+              <button
+                type="button"
+                onClick={() => handleLanguageChange('en-US')}
+                aria-pressed={settings.language === 'en-US'}
+                className={`py-2 px-3 rounded-lg text-xs font-semibold transition-all cursor-pointer whitespace-nowrap ${
+                  settings.language === 'en-US'
+                    ? 'bg-cyan-500 text-slate-950 shadow-xs'
+                    : darkMode
+                    ? 'text-slate-300 hover:text-white hover:bg-slate-800/70'
+                    : 'text-slate-700 hover:text-slate-900 hover:bg-white/60'
+                }`}
+              >
+                English (en-US)
+              </button>
+
+              <button
+                type="button"
+                onClick={() => handleLanguageChange('id-ID')}
+                aria-pressed={settings.language === 'id-ID'}
+                className={`py-2 px-3 rounded-lg text-xs font-semibold transition-all cursor-pointer whitespace-nowrap ${
+                  settings.language === 'id-ID'
+                    ? 'bg-cyan-500 text-slate-950 shadow-xs'
+                    : darkMode
+                    ? 'text-slate-300 hover:text-white hover:bg-slate-800/70'
+                    : 'text-slate-700 hover:text-slate-900 hover:bg-white/60'
+                }`}
+              >
+                Bahasa Indonesia (id-ID)
+              </button>
+            </div>
+          </div>
+
+          {/* 2. Voice Synthesis Configuration */}
+          <div
+            className={`pt-4 border-t space-y-3.5 ${
+              darkMode ? 'border-slate-800' : 'border-slate-200'
+            }`}
+          >
             <div className="flex items-center justify-between">
               <label
                 htmlFor="atlas-voice-select"
@@ -177,7 +239,9 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                     : 'bg-slate-50 border-slate-300 text-slate-900'
                 }`}
               >
-                <option value="">Default System Voice</option>
+                <option value="">
+                  Auto-Select Voice ({settings.language === 'id-ID' ? 'Indonesian / Default' : 'English / Default'})
+                </option>
                 {availableVoices.map((voice) => (
                   <option key={voice.voiceURI} value={voice.voiceURI}>
                     {voice.name} ({voice.lang}) {voice.default ? '— Default' : ''}
@@ -246,7 +310,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
             </div>
           </div>
 
-          {/* 2. System Behavior Toggles */}
+          {/* 3. System Behavior Toggles */}
           <div
             className={`pt-4 border-t space-y-3 ${
               darkMode ? 'border-slate-800' : 'border-slate-200'
@@ -354,7 +418,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
             </div>
           </div>
 
-          {/* 3. Microphone Permission Status */}
+          {/* 4. Microphone Permission Status */}
           <div
             className={`pt-4 border-t flex items-center justify-between gap-4 ${
               darkMode ? 'border-slate-800' : 'border-slate-200'
@@ -379,7 +443,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
             )}
           </div>
 
-          {/* 4. Clear Conversation */}
+          {/* 5. Clear Conversation */}
           <div
             className={`pt-4 border-t flex items-center justify-between gap-4 ${
               darkMode ? 'border-slate-800' : 'border-slate-200'

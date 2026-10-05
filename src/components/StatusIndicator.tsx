@@ -12,11 +12,12 @@ import {
   Calculator,
   VolumeX,
 } from 'lucide-react';
-import { AICoreState, ChatMessage } from '../types/atlas';
+import { AICoreState, ChatMessage, RecognitionLanguage } from '../types/atlas';
 
 interface StatusIndicatorProps {
   state: AICoreState;
-  interimTranscript: string;
+  liveTranscript: string;
+  language: RecognitionLanguage;
   latestAtlasMessage: ChatMessage | null;
   latestUserMessage: ChatMessage | null;
   errorMessage: string | null;
@@ -27,7 +28,8 @@ interface StatusIndicatorProps {
 
 export const StatusIndicator: React.FC<StatusIndicatorProps> = ({
   state,
-  interimTranscript,
+  liveTranscript,
+  language,
   latestAtlasMessage,
   latestUserMessage,
   errorMessage,
@@ -40,27 +42,30 @@ export const StatusIndicator: React.FC<StatusIndicatorProps> = ({
       case 'listening':
         return {
           title: 'Listening...',
-          subtitle: 'Speak your command or question clearly into the microphone',
+          subtitle:
+            language === 'id-ID'
+              ? 'Silakan berbicara dengan jelas (Bahasa Indonesia)'
+              : 'Speak naturally — pauses are handled automatically',
           icon: <Radio className="w-4 h-4 text-cyan-400 animate-pulse shrink-0" />,
           tone: darkMode ? 'text-cyan-300' : 'text-cyan-700',
         };
       case 'thinking':
         return {
           title: 'Thinking...',
-          subtitle: 'Processing neural inference & verifying telemetry',
+          subtitle: 'Processing request & synthesizing response',
           icon: <Loader2 className="w-4 h-4 text-sky-400 animate-spin shrink-0" />,
           tone: darkMode ? 'text-sky-300' : 'text-sky-700',
         };
       case 'speaking':
         return {
           title: 'Speaking...',
-          subtitle: 'Voice synthesis active',
+          subtitle: 'Voice synthesis active (Microphone paused)',
           icon: <Volume2 className="w-4 h-4 text-cyan-400 animate-bounce shrink-0" />,
           tone: darkMode ? 'text-cyan-300' : 'text-cyan-700',
         };
       case 'error':
         return {
-          title: 'System Alert',
+          title: 'Notice',
           subtitle: errorMessage || 'An unexpected interruption occurred',
           icon: <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />,
           tone: darkMode ? 'text-rose-300' : 'text-rose-700',
@@ -68,7 +73,9 @@ export const StatusIndicator: React.FC<StatusIndicatorProps> = ({
       default:
         return {
           title: 'Ready',
-          subtitle: 'Awaiting voice command or text directive',
+          subtitle: errorMessage
+            ? errorMessage
+            : `Awaiting voice or text directive (${language === 'id-ID' ? 'Bahasa Indonesia' : 'English'})`,
           icon: <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />,
           tone: darkMode ? 'text-emerald-300' : 'text-emerald-700',
         };
@@ -118,7 +125,7 @@ export const StatusIndicator: React.FC<StatusIndicatorProps> = ({
       aria-live="polite"
       className="w-full max-w-2xl mx-auto px-4 flex flex-col items-center text-center gap-3"
     >
-      {/* Primary State Readout Line (Unboxed clean metadata with typographic separator) */}
+      {/* Primary State Readout Line */}
       <div className="flex flex-wrap items-center justify-center gap-2 text-sm font-mono">
         <div className="flex items-center gap-1.5 font-semibold">
           {meta.icon}
@@ -143,20 +150,33 @@ export const StatusIndicator: React.FC<StatusIndicatorProps> = ({
         )}
       </div>
 
-      {/* Live Interim Speech Transcript Box (While Listening) */}
-      {state === 'listening' && interimTranscript && (
+      {/* Live Speech Transcript Box (Always visible while Listening) */}
+      {state === 'listening' && (
         <div
-          className={`w-full rounded-xl border px-4 py-3 backdrop-blur-md transition-all ${
+          className={`w-full rounded-xl border px-4 py-3.5 backdrop-blur-md transition-all ${
             darkMode
-              ? 'bg-cyan-950/35 border-cyan-400/40 text-cyan-100'
+              ? 'bg-cyan-950/35 border-cyan-400/40 text-cyan-100 shadow-[0_0_25px_rgba(6,182,212,0.15)]'
               : 'bg-cyan-50/90 border-cyan-500/40 text-slate-900'
           }`}
         >
-          <div className="text-[11px] font-mono text-cyan-400 mb-1">
-            LIVE VOICE CAPTURE
+          <div className="text-[11px] font-mono text-cyan-400 mb-1 uppercase tracking-wider">
+            Listening... ({language})
           </div>
-          <p className="text-base font-medium leading-relaxed">
-            &ldquo;{interimTranscript}&rdquo;
+          <p
+            className={`text-base font-medium leading-relaxed ${
+              liveTranscript
+                ? ''
+                : darkMode
+                ? 'text-slate-400 italic'
+                : 'text-slate-500 italic'
+            }`}
+          >
+            &ldquo;
+            {liveTranscript ||
+              (language === 'id-ID'
+                ? 'Kata-kata Anda akan muncul di sini saat berbicara...'
+                : 'You can see the words appearing here as you speak...')}
+            &rdquo;
           </p>
         </div>
       )}

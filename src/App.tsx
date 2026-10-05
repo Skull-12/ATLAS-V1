@@ -68,6 +68,7 @@ declare global {
 }
 
 const DEFAULT_SETTINGS: VoiceSettings = {
+  language: 'en-US',
   voiceURI: '',
   rate: 1.0,
   pitch: 1.0,
@@ -76,8 +77,15 @@ const DEFAULT_SETTINGS: VoiceSettings = {
   webSearchEnabled: true,
 };
 
-const STORAGE_SETTINGS_KEY = 'atlas_voice_settings_v1';
-const STORAGE_MESSAGES_KEY = 'atlas_conversation_v1';
+const STORAGE_SETTINGS_KEY = 'atlas_voice_settings_v2';
+const STORAGE_MESSAGES_KEY = 'atlas_conversation_v2';
+
+// Intelligent silence wait duration (700-1200ms range)
+const SILENCE_WAIT_MS = 950;
+// Minimum cooldown between consecutive AI requests
+const REQUEST_COOLDOWN_MS = 1200;
+// Maximum stored conversation items
+const MAX_STORED_MESSAGES = 30;
 
 function formatTimestamp(date = new Date()): string {
   return date.toLocaleTimeString([], {
@@ -94,14 +102,43 @@ function cleanTextForSpeech(text: string): string {
     .replace(/`([^`]+)`/g, '$1')
     .replace(/#{1,6}\s+/g, '')
     .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
-    .replace(/https?:\/\/\S+/g, 'link provided on screen')
+    .replace(/https?:\/\/\S+/g, 'link on screen')
     .trim();
 }
 
+/**
+ * Cleans the final speech transcript before sending to Gemini:
+ * - Removes extra whitespace
+ * - Removes accidental immediate consecutive duplicate words (e.g. "what what is" -> "what is")
+ * - Preserves the user's actual meaning without aggressive rewriting
+ */
+function cleanFinalTranscript(raw: string): string {
+  const normalizedWhitespace = raw.replace(/\s+/g, ' ').trim();
+  if (!normalizedWhitespace) return '';
+
+  const words = normalizedWhitespace.split(' ');
+  const deduplicated: string[] = [];
+
+  for (const word of words) {
+    const prev = deduplicated[deduplicated.length - 1];
+    if (
+      prev &&
+      prev.toLowerCase().replace(/[.,!?]/g, '') ===
+        word.toLowerCase().replace(/[.,!?]/g, '') &&
+      word.length > 1
+    ) {
+      continue;
+    }
+    deduplicated.push(word);
+  }
+
+  return deduplicated.join(' ').trim();
+}
+
 export default function App() {
-  // Core State
+  // Core State: idle -> listening -> thinking -> speaking -> idle
   const [coreState, setCoreState] = useState<AICoreState>('idle');
-  const [interimTranscript, setInterimTranscript] = useState<string>('');
+  const [liveTranscript, setLiveTranscript] = useState<string>('');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   // Panels
@@ -113,7 +150,12 @@ export default function App() {
     try {
       const saved = localStorage.getItem(STORAGE_SETTINGS_KEY);
       if (saved) {
-        return { ...DEFAULT_SETTINGS, ...JSON.parse(saved) };
+        const parsed = JSON.parse(saved);
+        return {
+          ...DEFAULT_SETTINGS,
+          ...parsed,
+          language: parsed.language === 'id-ID' ? 'id-ID' : 'en-US',
+        };
       }
     } catch {
       // Ignore storage error
@@ -128,7 +170,7 @@ export default function App() {
       if (saved) {
         const parsed = JSON.parse(saved);
         if (Array.isArray(parsed) && parsed.length > 0) {
-          return parsed;
+          return parsed.slice(-MAX_STORED_MESSAGES);
         }
       }
     } catch {
@@ -163,14 +205,29 @@ export default function App() {
   const [audioLevel, setAudioLevel] = useState<number>(0);
   const [frequencyData, setFrequencyData] = useState<Uint8Array | null>(null);
 
-  // Refs for mutable callbacks & audio hardware
+  // Refs for state & request lifecycle management
   const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
-  const finalTranscriptBufferRef = useRef<string>('');
+  const silenceTimerRef = useRef<number | null>(null);
+  const errorResetTimerRef = useRef<number | null>(null);
+
   const isListeningRef = useRef<boolean>(false);
+  const isProcessingRef = useRef<boolean>(false);
+  const isSpeakingRef = useRef<boolean>(false);
+  const hasFinalizedSpeechRef = useRef<boolean>(false);
+
+  const finalTranscriptRef = useRef<string>('');
+  const interimTranscriptRef = useRef<string>('');
+
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const lastRequestTimeRef = useRef<number>(0);
+  const lastSubmittedMessageRef = useRef<string>('');
+  const retryAfterUntilRef = useRef<number>(0);
+
   const audioContextRef = useRef<AudioContext | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const analyserFrameRef = useRef<number | null>(null);
   const speechPulseIntervalRef = useRef<number | null>(null);
+
   const settingsRef = useRef<VoiceSettings>(settings);
   const messagesRef = useRef<ChatMessage[]>(messages);
 
@@ -186,13 +243,16 @@ export default function App() {
   useEffect(() => {
     messagesRef.current = messages;
     try {
-      localStorage.setItem(STORAGE_MESSAGES_KEY, JSON.stringify(messages.slice(-50)));
+      localStorage.setItem(
+        STORAGE_MESSAGES_KEY,
+        JSON.stringify(messages.slice(-MAX_STORED_MESSAGES))
+      );
     } catch {
       // Ignore
     }
   }, [messages]);
 
-  // Check Server Health Status
+  // Check Server Health Status once on mount
   useEffect(() => {
     let mounted = true;
     fetch('/api/status')
@@ -217,7 +277,7 @@ export default function App() {
     };
   }, []);
 
-  // Check Browser Speech & Mic Permissions
+  // Check Browser Speech & Mic Permissions once on mount
   useEffect(() => {
     const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
     setSpeechRecognitionSupported(Boolean(SpeechRec));
@@ -259,6 +319,18 @@ export default function App() {
     };
   }, []);
 
+  // Helper to show a temporary error state and return safely to idle
+  const showTemporaryError = useCallback((msg: string, durationMs = 4500) => {
+    if (errorResetTimerRef.current) {
+      window.clearTimeout(errorResetTimerRef.current);
+    }
+    setErrorMessage(msg);
+    setCoreState('error');
+    errorResetTimerRef.current = window.setTimeout(() => {
+      setCoreState((prev) => (prev === 'error' ? 'idle' : prev));
+    }, durationMs);
+  }, []);
+
   // Stop Microphone Web Audio Stream
   const stopAudioAnalyser = useCallback(() => {
     if (analyserFrameRef.current) {
@@ -290,7 +362,9 @@ export default function App() {
       setMicPermission('granted');
       mediaStreamRef.current = stream;
 
-      const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      const AudioCtx =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
       const audioCtx = new AudioCtx();
       audioContextRef.current = audioCtx;
 
@@ -320,10 +394,30 @@ export default function App() {
 
       analyserFrameRef.current = requestAnimationFrame(updateAudioMeter);
     } catch {
-      // If simultaneous getUserMedia fails on certain devices while SpeechRecognition is active,
-      // VoiceVisualizer gracefully falls back to synthetic active waves.
+      // Fallback handled by VoiceVisualizer
     }
   }, []);
+
+  // Immediately stop SpeechRecognition without processing
+  const abortSpeechRecognition = useCallback(() => {
+    if (silenceTimerRef.current) {
+      window.clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
+    isListeningRef.current = false;
+    stopAudioAnalyser();
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.onresult = null;
+        recognitionRef.current.onend = null;
+        recognitionRef.current.onerror = null;
+        recognitionRef.current.abort();
+      } catch {
+        // Ignore abort errors
+      }
+      recognitionRef.current = null;
+    }
+  }, [stopAudioAnalyser]);
 
   // Stop Speaking Function
   const stopSpeaking = useCallback(() => {
@@ -334,28 +428,43 @@ export default function App() {
     if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
       window.speechSynthesis.cancel();
     }
+    if (isSpeakingRef.current) {
+      console.log('[ATLAS] Speech synthesis finished');
+    }
+    isSpeakingRef.current = false;
     setAudioLevel(0);
     setCoreState((prev) => (prev === 'speaking' ? 'idle' : prev));
   }, []);
 
-  // Speak Text via Browser SpeechSynthesis
+  // Speak Text via Browser SpeechSynthesis (Temporarily disables speech recognition so ATLAS never hears itself)
   const speakResponse = useCallback(
     (rawText: string, forceSpeak = false) => {
       const currentSettings = settingsRef.current;
+
+      // Ensure microphone recognition is completely stopped before speaking
+      abortSpeechRecognition();
+
       if (!currentSettings.autoSpeak && !forceSpeak) {
+        isSpeakingRef.current = false;
         setCoreState('idle');
         return;
       }
 
       if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
+        isSpeakingRef.current = false;
         setCoreState('idle');
         return;
       }
 
-      stopSpeaking();
+      if (speechPulseIntervalRef.current) {
+        window.clearInterval(speechPulseIntervalRef.current);
+        speechPulseIntervalRef.current = null;
+      }
+      window.speechSynthesis.cancel();
 
       const cleaned = cleanTextForSpeech(rawText);
       if (!cleaned) {
+        isSpeakingRef.current = false;
         setCoreState('idle');
         return;
       }
@@ -363,6 +472,7 @@ export default function App() {
       const utterance = new SpeechSynthesisUtterance(cleaned);
       utterance.rate = currentSettings.rate;
       utterance.pitch = currentSettings.pitch;
+      utterance.lang = currentSettings.language;
 
       const voices = window.speechSynthesis.getVoices();
       if (currentSettings.voiceURI) {
@@ -370,9 +480,13 @@ export default function App() {
         if (matched) {
           utterance.voice = matched;
         }
+      } else if (currentSettings.language === 'id-ID') {
+        const idVoice = voices.find((v) => v.lang.toLowerCase().startsWith('id'));
+        if (idVoice) {
+          utterance.voice = idVoice;
+        }
       } else {
-        // Select a refined English voice if available
-        const preferred =
+        const preferredEn =
           voices.find(
             (v) =>
               v.lang.startsWith('en') &&
@@ -381,12 +495,14 @@ export default function App() {
                 v.name.includes('Daniel') ||
                 v.name.includes('Samantha'))
           ) || voices.find((v) => v.lang.startsWith('en'));
-        if (preferred) {
-          utterance.voice = preferred;
+        if (preferredEn) {
+          utterance.voice = preferredEn;
         }
       }
 
       utterance.onstart = () => {
+        console.log('[ATLAS] Speech synthesis started');
+        isSpeakingRef.current = true;
         setCoreState('speaking');
         if (speechPulseIntervalRef.current) {
           window.clearInterval(speechPulseIntervalRef.current);
@@ -401,51 +517,87 @@ export default function App() {
       };
 
       utterance.onend = () => {
+        console.log('[ATLAS] Speech synthesis finished');
         if (speechPulseIntervalRef.current) {
           window.clearInterval(speechPulseIntervalRef.current);
           speechPulseIntervalRef.current = null;
         }
+        isSpeakingRef.current = false;
         setAudioLevel(0);
         setCoreState('idle');
       };
 
       utterance.onerror = () => {
+        console.log('[ATLAS] Speech synthesis finished');
         if (speechPulseIntervalRef.current) {
           window.clearInterval(speechPulseIntervalRef.current);
           speechPulseIntervalRef.current = null;
         }
+        isSpeakingRef.current = false;
         setAudioLevel(0);
         setCoreState('idle');
       };
 
+      isSpeakingRef.current = true;
       setCoreState('speaking');
       window.speechSynthesis.speak(utterance);
     },
-    [stopSpeaking]
+    [abortSpeechRecognition]
   );
 
-  // Process User Directive (Voice or Text)
-  const handleProcessDirective = useCallback(
-    async (rawInput: string) => {
-      const trimmed = rawInput.trim();
-      if (!trimmed) return;
+  /**
+   * Centralized Request Pipeline: sendMessageToAI(message)
+   * Used by BOTH voice input and text input.
+   */
+  const sendMessageToAI = useCallback(
+    async (rawMessage: string) => {
+      // 1. Clean and validate message
+      const cleanedMessage = cleanFinalTranscript(rawMessage);
+      if (!cleanedMessage || cleanedMessage.length < 2) {
+        const shortMsg = "I didn't catch that. Please try again.";
+        setErrorMessage(shortMsg);
+        setCoreState('idle');
+        return;
+      }
 
+      // 2. Check whether another request is already running
+      if (isProcessingRef.current) {
+        return;
+      }
+
+      const now = Date.now();
+
+      // Debounce accidental repeated identical submissions within 2.5s
+      if (
+        cleanedMessage.toLowerCase() === lastSubmittedMessageRef.current.toLowerCase() &&
+        now - lastRequestTimeRef.current < 2500
+      ) {
+        return;
+      }
+
+      // Small cooldown between requests
+      if (now - lastRequestTimeRef.current < REQUEST_COOLDOWN_MS) {
+        return;
+      }
+
+      // Ensure speech recognition & synthesis are stopped
+      abortSpeechRecognition();
       stopSpeaking();
+      setLiveTranscript('');
       setErrorMessage(null);
-      setInterimTranscript('');
 
+      // Append user message to conversation memory (bounded size)
       const userMsg: ChatMessage = {
-        id: `user-${Date.now()}`,
+        id: `user-${now}`,
         sender: 'user',
-        text: trimmed,
+        text: cleanedMessage,
         timestamp: formatTimestamp(),
       };
 
-      setMessages((prev) => [...prev, userMsg]);
-      setCoreState('thinking');
+      setMessages((prev) => [...prev.slice(-(MAX_STORED_MESSAGES - 1)), userMsg]);
 
-      // 1. Evaluate through CommandHandler first
-      const commandEval = evaluateUserCommand(trimmed);
+      // Check local commands first (time, date, math, UI panels, browser links)
+      const commandEval = evaluateUserCommand(cleanedMessage);
 
       if (commandEval.uiAction === 'open_settings') {
         setIsSettingsOpen(true);
@@ -466,6 +618,9 @@ export default function App() {
       }
 
       if (commandEval.handledLocally && commandEval.reply) {
+        lastSubmittedMessageRef.current = cleanedMessage;
+        lastRequestTimeRef.current = now;
+
         const localAtlasMsg: ChatMessage = {
           id: `atlas-local-${Date.now()}`,
           sender: 'atlas',
@@ -476,32 +631,67 @@ export default function App() {
           actionLink: commandEval.actionLink,
           calculationResult: commandEval.calculationResult,
         };
-        setMessages((prev) => [...prev, localAtlasMsg]);
+        setMessages((prev) => [...prev.slice(-(MAX_STORED_MESSAGES - 1)), localAtlasMsg]);
         speakResponse(localAtlasMsg.text);
         return;
       }
 
-      // 2. Otherwise query the Gemini API on the server
+      // Respect rate-limit retry period if active
+      if (now < retryAfterUntilRef.current) {
+        const friendlyRateLimitMsg =
+          'ATLAS is temporarily unavailable. Please wait a moment and try again.';
+        const rateLimitChatMsg: ChatMessage = {
+          id: `atlas-rl-${now}`,
+          sender: 'atlas',
+          text: friendlyRateLimitMsg,
+          timestamp: formatTimestamp(),
+          sourceType: 'local_system',
+          commandCategory: 'Rate Limit Cooldown',
+          isError: true,
+        };
+        setMessages((prev) => [...prev.slice(-(MAX_STORED_MESSAGES - 1)), rateLimitChatMsg]);
+        showTemporaryError(friendlyRateLimitMsg);
+        return;
+      }
+
+      // 3. Lock request state & transition to "thinking"
+      isProcessingRef.current = true;
+      lastSubmittedMessageRef.current = cleanedMessage;
+      lastRequestTimeRef.current = now;
+      setCoreState('thinking');
+
+      // Cancel any stale AbortController
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+      }
+      const controller = new AbortController();
+      abortControllerRef.current = controller;
+
+      // 4. Send exactly ONE Gemini request
+      console.log('[ATLAS] Sending request');
+
       try {
         const recentHistory = messagesRef.current
-          .filter((m) => !m.isError)
-          .slice(-8)
+          .filter((m) => !m.isError && m.id !== 'atlas-welcome')
+          .slice(-6)
           .map((m) => ({
             role: m.sender === 'user' ? 'user' : 'model',
             text: m.text,
           }));
 
-        const now = new Date();
+        const currentDateObj = new Date();
         const response = await fetch('/api/atlas/chat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
+          signal: controller.signal,
           body: JSON.stringify({
-            message: commandEval.transformedPrompt || trimmed,
+            message: commandEval.transformedPrompt || cleanedMessage,
             history: recentHistory,
             forceSearch: Boolean(commandEval.forceSearch),
             enableSearch: settingsRef.current.webSearchEnabled,
-            clientTime: now.toLocaleTimeString(),
-            clientDate: now.toLocaleDateString(undefined, {
+            language: settingsRef.current.language,
+            clientTime: currentDateObj.toLocaleTimeString(),
+            clientDate: currentDateObj.toLocaleDateString(undefined, {
               weekday: 'long',
               year: 'numeric',
               month: 'long',
@@ -511,11 +701,47 @@ export default function App() {
           }),
         });
 
-        const data = await response.json();
+        const data = await response.json().catch(() => ({}));
+
+        // Handle 429 Rate Limit / Quota Exhausted
+        if (response.status === 429 || data.code === 'RATE_LIMIT') {
+          const retrySecs =
+            typeof data.retryAfterSeconds === 'number' ? data.retryAfterSeconds : 15;
+          retryAfterUntilRef.current = Date.now() + retrySecs * 1000;
+
+          if (data.technicalError) {
+            console.warn('[ATLAS] Rate limit details:', data.technicalError);
+          }
+
+          const friendlyMsg =
+            'ATLAS is temporarily unavailable. Please wait a moment and try again.';
+
+          const rlAtlasMsg: ChatMessage = {
+            id: `atlas-429-${Date.now()}`,
+            sender: 'atlas',
+            text: friendlyMsg,
+            timestamp: formatTimestamp(),
+            sourceType: 'local_system',
+            commandCategory: 'Rate Limit',
+            isError: true,
+          };
+
+          setMessages((prev) => [...prev.slice(-(MAX_STORED_MESSAGES - 1)), rlAtlasMsg]);
+          showTemporaryError(friendlyMsg);
+          return;
+        }
 
         if (!response.ok || data.error) {
-          throw new Error(data.error || 'Failed to retrieve response from ATLAS cognitive core.');
+          if (data.technicalError) {
+            console.warn('[ATLAS] Technical API diagnostic:', data.technicalError);
+          }
+          throw new Error(
+            data.error || 'ATLAS encountered an issue processing your request. Please try again.'
+          );
         }
+
+        // 5. Receive & display response
+        console.log('[ATLAS] Response received');
 
         const atlasMsg: ChatMessage = {
           id: `atlas-${Date.now()}`,
@@ -525,25 +751,24 @@ export default function App() {
           sourceType: data.sourceType || 'ai_knowledge',
           sources: data.sources || [],
           searchQueries: data.searchQueries || [],
-          commandCategory: data.quotaNotice
-            ? 'Quota Advisory'
-            : commandEval.commandCategory,
-          isError: Boolean(data.isError),
+          commandCategory: commandEval.commandCategory,
         };
 
-        setMessages((prev) => [...prev, atlasMsg]);
-        if (data.isError) {
-          setErrorMessage(data.reply);
-          setCoreState('error');
-        }
+        setMessages((prev) => [...prev.slice(-(MAX_STORED_MESSAGES - 1)), atlasMsg]);
+
+        // 6. Trigger text-to-speech if enabled (or return to idle)
         speakResponse(atlasMsg.text);
       } catch (err: unknown) {
+        if (err instanceof DOMException && err.name === 'AbortError') {
+          setCoreState('idle');
+          return;
+        }
+
+        console.warn('[ATLAS] Request diagnostic:', err);
         const errText =
           err instanceof Error
             ? err.message
-            : 'Communication error with the ATLAS server. Please verify your connection.';
-        setErrorMessage(errText);
-        setCoreState('error');
+            : 'ATLAS encountered a communication error. Please try again.';
 
         const errAtlasMsg: ChatMessage = {
           id: `atlas-err-${Date.now()}`,
@@ -551,51 +776,101 @@ export default function App() {
           text: errText,
           timestamp: formatTimestamp(),
           sourceType: 'local_system',
-          commandCategory: 'Diagnostic Alert',
+          commandCategory: 'System Notice',
           isError: true,
         };
-        setMessages((prev) => [...prev, errAtlasMsg]);
-        speakResponse(errText);
+
+        setMessages((prev) => [...prev.slice(-(MAX_STORED_MESSAGES - 1)), errAtlasMsg]);
+        showTemporaryError(errText);
+      } finally {
+        isProcessingRef.current = false;
+        abortControllerRef.current = null;
       }
     },
-    [speakResponse, stopSpeaking]
+    [abortSpeechRecognition, showTemporaryError, speakResponse, stopSpeaking]
   );
 
-  // Stop Listening Function
-  const stopListening = useCallback(() => {
+  /**
+   * Finalize the current listening session ONCE and send the single final transcript to AI
+   */
+  const finalizeListeningSession = useCallback(() => {
+    if (hasFinalizedSpeechRef.current) {
+      return;
+    }
+    hasFinalizedSpeechRef.current = true;
+
+    if (silenceTimerRef.current) {
+      window.clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
+
     isListeningRef.current = false;
     stopAudioAnalyser();
+
     if (recognitionRef.current) {
       try {
+        recognitionRef.current.onresult = null;
+        recognitionRef.current.onend = null;
         recognitionRef.current.stop();
       } catch {
         // Ignore stop errors
       }
+      recognitionRef.current = null;
     }
-  }, [stopAudioAnalyser]);
 
-  // Start Listening via Web Speech API
-  const startListening = useCallback(() => {
-    const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SpeechRec) {
-      setSpeechRecognitionSupported(false);
-      setErrorMessage('Speech recognition is not supported in this browser.');
-      setCoreState('error');
+    const combinedRaw = `${finalTranscriptRef.current} ${interimTranscriptRef.current}`.trim();
+    finalTranscriptRef.current = '';
+    interimTranscriptRef.current = '';
+
+    const cleaned = cleanFinalTranscript(combinedRaw);
+    console.log('[ATLAS] Speech finalized');
+
+    if (!cleaned || cleaned.length < 2) {
+      setLiveTranscript('');
+      setErrorMessage("I didn't catch that. Please try again.");
+      setCoreState('idle');
       return;
     }
 
+    sendMessageToAI(cleaned);
+  }, [sendMessageToAI, stopAudioAnalyser]);
+
+  // Start Listening via Web Speech API (with continuous=true, interimResults=true, and 950ms pause buffer)
+  const startListening = useCallback(() => {
+    // Do not start listening if a request is processing or if ATLAS is currently speaking
+    if (isProcessingRef.current || isSpeakingRef.current) {
+      return;
+    }
+
+    const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRec) {
+      setSpeechRecognitionSupported(false);
+      showTemporaryError('Speech recognition is not supported in this browser.');
+      return;
+    }
+
+    abortSpeechRecognition();
     stopSpeaking();
+
+    if (errorResetTimerRef.current) {
+      window.clearTimeout(errorResetTimerRef.current);
+      errorResetTimerRef.current = null;
+    }
+
     setErrorMessage(null);
-    setInterimTranscript('');
-    finalTranscriptBufferRef.current = '';
+    setLiveTranscript('');
+    finalTranscriptRef.current = '';
+    interimTranscriptRef.current = '';
+    hasFinalizedSpeechRef.current = false;
 
     try {
       const recognition = new SpeechRec();
-      recognition.continuous = false;
+      recognition.continuous = true;
       recognition.interimResults = true;
-      recognition.lang = navigator.language || 'en-US';
+      recognition.lang = settingsRef.current.language || 'en-US';
 
       recognition.onstart = () => {
+        console.log('[ATLAS] Microphone started');
         isListeningRef.current = true;
         setMicPermission('granted');
         setCoreState('listening');
@@ -603,79 +878,137 @@ export default function App() {
       };
 
       recognition.onresult = (event: SpeechRecognitionEvent) => {
-        let interim = '';
-        let finalStr = '';
+        // Ignore any recognition events if ATLAS is speaking or already finalized
+        if (isSpeakingRef.current || hasFinalizedSpeechRef.current) {
+          return;
+        }
 
-        for (let i = event.resultIndex; i < event.results.length; i++) {
+        let finalBuilder = '';
+        let interimBuilder = '';
+
+        for (let i = 0; i < event.results.length; i++) {
           const res = event.results[i];
+          const textPiece = res[0]?.transcript || '';
           if (res.isFinal) {
-            finalStr += res[0].transcript;
+            finalBuilder += textPiece + ' ';
           } else {
-            interim += res[0].transcript;
+            interimBuilder += textPiece + ' ';
           }
         }
 
-        if (finalStr) {
-          finalTranscriptBufferRef.current += finalStr;
+        finalTranscriptRef.current = finalBuilder.trim();
+        interimTranscriptRef.current = interimBuilder.trim();
+
+        const currentCombined = `${finalTranscriptRef.current} ${interimTranscriptRef.current}`.trim();
+        // Update live UI transcript ONLY — never call Gemini here
+        setLiveTranscript(currentCombined);
+
+        // Intelligent silence handling: reset the 950ms silence timer whenever new speech arrives
+        if (silenceTimerRef.current) {
+          window.clearTimeout(silenceTimerRef.current);
         }
-        setInterimTranscript((finalTranscriptBufferRef.current + ' ' + interim).trim());
+
+        if (currentCombined.length > 0) {
+          silenceTimerRef.current = window.setTimeout(() => {
+            finalizeListeningSession();
+          }, SILENCE_WAIT_MS);
+        }
       };
 
       recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
+        if (silenceTimerRef.current) {
+          window.clearTimeout(silenceTimerRef.current);
+          silenceTimerRef.current = null;
+        }
         isListeningRef.current = false;
         stopAudioAnalyser();
 
         if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
           setMicPermission('denied');
-          setErrorMessage(
-            'Microphone access was denied. Please allow microphone permission in your browser settings or type your command.'
+          showTemporaryError(
+            'Microphone access was denied. Please allow microphone permission or type your command.'
           );
-          setCoreState('error');
         } else if (event.error === 'no-speech') {
-          setErrorMessage('No speech detected. Click the microphone when ready to speak.');
+          setLiveTranscript('');
+          setErrorMessage("I didn't catch that. Please try again.");
           setCoreState('idle');
         } else if (event.error === 'aborted') {
-          setCoreState('idle');
+          setCoreState((prev) => (prev === 'listening' ? 'idle' : prev));
         } else {
-          setErrorMessage(`Speech recognition issue (${event.error}). Try again or use text input.`);
-          setCoreState('error');
+          console.warn('[ATLAS] SpeechRecognition error:', event.error);
+          showTemporaryError(`Speech recognition error (${event.error}). Please try again.`);
         }
       };
 
       recognition.onend = () => {
-        const wasListening = isListeningRef.current;
-        isListeningRef.current = false;
-        stopAudioAnalyser();
+        if (hasFinalizedSpeechRef.current) {
+          return;
+        }
 
-        const captured = finalTranscriptBufferRef.current.trim();
-        if (captured) {
-          finalTranscriptBufferRef.current = '';
-          handleProcessDirective(captured);
-        } else if (wasListening) {
+        // If the browser ended recognition while we have collected speech, wait for or trigger finalization once
+        const collected = `${finalTranscriptRef.current} ${interimTranscriptRef.current}`.trim();
+        if (collected.length > 0) {
+          if (silenceTimerRef.current) {
+            window.clearTimeout(silenceTimerRef.current);
+            silenceTimerRef.current = null;
+          }
+          finalizeListeningSession();
+        } else {
+          isListeningRef.current = false;
+          stopAudioAnalyser();
           setCoreState((prev) => (prev === 'listening' ? 'idle' : prev));
         }
       };
 
       recognitionRef.current = recognition;
       recognition.start();
-    } catch {
-      setErrorMessage('Could not initialize speech recognition.');
-      setCoreState('error');
+    } catch (err) {
+      console.error('[ATLAS] Could not initialize speech recognition:', err);
+      showTemporaryError('Could not initialize speech recognition.');
     }
-  }, [handleProcessDirective, startAudioAnalyser, stopAudioAnalyser, stopSpeaking]);
+  }, [
+    abortSpeechRecognition,
+    finalizeListeningSession,
+    showTemporaryError,
+    startAudioAnalyser,
+    stopAudioAnalyser,
+    stopSpeaking,
+  ]);
 
-  // Toggle Microphone Listening
+  // Toggle Microphone Button / Orb Click
   const handleToggleListening = useCallback(() => {
-    if (coreState === 'speaking') {
+    // Prevent duplicate actions while thinking
+    if (isProcessingRef.current || coreState === 'thinking') {
+      return;
+    }
+
+    // If ATLAS is speaking, clicking stops speech synthesis and returns to idle
+    if (coreState === 'speaking' || isSpeakingRef.current) {
       stopSpeaking();
       return;
     }
+
+    // If currently listening, finalize any spoken transcript or return to idle
     if (coreState === 'listening' || isListeningRef.current) {
-      stopListening();
-    } else {
-      startListening();
+      const collected = `${finalTranscriptRef.current} ${interimTranscriptRef.current}`.trim();
+      if (collected.length > 0) {
+        finalizeListeningSession();
+      } else {
+        abortSpeechRecognition();
+        setLiveTranscript('');
+        setCoreState('idle');
+      }
+      return;
     }
-  }, [coreState, startListening, stopListening, stopSpeaking]);
+
+    startListening();
+  }, [
+    abortSpeechRecognition,
+    coreState,
+    finalizeListeningSession,
+    startListening,
+    stopSpeaking,
+  ]);
 
   // Request Microphone Permission Explicitly from Settings
   const handleRequestMicPermission = useCallback(async () => {
@@ -686,12 +1019,13 @@ export default function App() {
       setErrorMessage(null);
     } catch {
       setMicPermission('denied');
-      setErrorMessage('Microphone access remains blocked by browser permissions.');
+      showTemporaryError('Microphone access remains blocked by browser permissions.');
     }
-  }, []);
+  }, [showTemporaryError]);
 
   // Clear Conversation History
   const handleClearConversation = useCallback(() => {
+    abortSpeechRecognition();
     stopSpeaking();
     const freshMsg: ChatMessage = {
       id: `atlas-fresh-${Date.now()}`,
@@ -702,13 +1036,38 @@ export default function App() {
       commandCategory: 'Memory Reset',
     };
     setMessages([freshMsg]);
+    setErrorMessage(null);
     setCoreState('idle');
-  }, [stopSpeaking]);
+  }, [abortSpeechRecognition, stopSpeaking]);
 
-  // Update Settings Helper
-  const handleUpdateSettings = useCallback((partial: Partial<VoiceSettings>) => {
-    setSettings((prev) => ({ ...prev, ...partial }));
-  }, []);
+  // Update Settings Helper (If language changes while listening, restart with new language)
+  const handleUpdateSettings = useCallback(
+    (partial: Partial<VoiceSettings>) => {
+      setSettings((prev) => {
+        const next = { ...prev, ...partial };
+        settingsRef.current = next;
+        return next;
+      });
+
+      if (partial.language && isListeningRef.current) {
+        abortSpeechRecognition();
+        setLiveTranscript('');
+        setCoreState('idle');
+      }
+    },
+    [abortSpeechRecognition]
+  );
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      abortSpeechRecognition();
+      stopSpeaking();
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+      }
+    };
+  }, [abortSpeechRecognition, stopSpeaking]);
 
   // Derive latest user and ATLAS messages for the HUD StatusIndicator
   const latestAtlasMessage =
@@ -724,7 +1083,7 @@ export default function App() {
         darkMode ? 'hud-grid-dark text-slate-100' : 'hud-grid-light text-slate-900'
       }`}
     >
-      {/* Subtle Futuristic Corner HUD Brackets (Tasteful & Non-Cluttered) */}
+      {/* Subtle Futuristic Corner HUD Brackets */}
       <div
         aria-hidden="true"
         className="pointer-events-none fixed inset-4 sm:inset-6 z-0 hidden sm:block"
@@ -794,13 +1153,14 @@ export default function App() {
           micPermission={micPermission}
           darkMode={darkMode}
           onToggleListening={handleToggleListening}
-          onSubmitText={handleProcessDirective}
+          onSubmitText={sendMessageToAI}
         />
 
-        {/* Live Status Indicator, Interim Transcript & Active Response Card */}
+        {/* Live Status Indicator, Live Transcript & Active Response Card */}
         <StatusIndicator
           state={coreState}
-          interimTranscript={interimTranscript}
+          liveTranscript={liveTranscript}
+          language={settings.language}
           latestAtlasMessage={latestAtlasMessage}
           latestUserMessage={latestUserMessage}
           errorMessage={errorMessage}
@@ -813,7 +1173,7 @@ export default function App() {
       {/* Bottom Voice Directives / Command Handler Deck */}
       <footer className="relative z-10 w-full pb-5 pt-2">
         <CommandHandler
-          onSelectCommand={handleProcessDirective}
+          onSelectCommand={sendMessageToAI}
           disabled={coreState === 'thinking'}
           darkMode={darkMode}
         />
@@ -826,7 +1186,7 @@ export default function App() {
         isProcessing={coreState === 'thinking'}
         darkMode={darkMode}
         onClose={() => setIsConversationOpen(false)}
-        onSendMessage={handleProcessDirective}
+        onSendMessage={sendMessageToAI}
         onClearConversation={handleClearConversation}
         onReplaySpeech={(txt) => speakResponse(txt, true)}
       />
@@ -844,7 +1204,9 @@ export default function App() {
         onUpdateSettings={handleUpdateSettings}
         onTestVoice={() =>
           speakResponse(
-            'ATLAS voice synthesis calibrated and operating at nominal parameters.',
+            settings.language === 'id-ID'
+              ? 'Sistem suara ATLAS telah dikalibrasi dan siap digunakan.'
+              : 'ATLAS voice synthesis calibrated and operating at nominal parameters.',
             true
           )
         }

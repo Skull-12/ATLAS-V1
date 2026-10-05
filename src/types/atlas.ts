@@ -4,6 +4,8 @@ export type KnowledgeSourceType = 'ai_knowledge' | 'web_search' | 'local_system'
 
 export type MicPermissionState = 'prompt' | 'granted' | 'denied' | 'unsupported';
 
+export type RecognitionLanguage = 'en-US' | 'id-ID';
+
 export interface GroundingSource {
   title: string;
   uri: string;
@@ -33,6 +35,7 @@ export interface ChatMessage {
 }
 
 export interface VoiceSettings {
+  language: RecognitionLanguage;
   voiceURI: string;
   rate: number;
   pitch: number;
